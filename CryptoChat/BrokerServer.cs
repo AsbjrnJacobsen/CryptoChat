@@ -21,12 +21,6 @@ public class BrokerServer
         _sessionKey = AESHelper.GenerateAESKey();
         Console.WriteLine("Session AES Key generated.");
         
-        // Generate the servers RSA key pair and export its public key
-        RSAParameters serverPublicKey, serverPrivateKey;
-        RSAHelper.GenerateRSAKeyPair(out serverPublicKey, out serverPrivateKey);
-        string publicKeyXml = RSAHelper.ExportPublicKey(serverPublicKey);
-        File.WriteAllText(ServerPublicKeyFile, publicKeyXml);
-        Console.WriteLine("Server public key written to file.");
         
         _listener = new TcpListener(IPAddress.Any, port);
         _listener.Start();
@@ -35,43 +29,70 @@ public class BrokerServer
         while (true)
         {
             var client = await _listener.AcceptTcpClientAsync();
-            _clients.Add(client);
             _ = HandleClientAsync(client);
         }
     }
 
     private async Task HandleClientAsync(TcpClient client)
     {
+        
         try
         {
+            // Limit Chats to 2 Users/Clients
+            if (_clients.Count >= 2)
+            {
+                Console.WriteLine("Rejected connection. Chat is limited to 2 users.");
+                client.Close();
+                return;
+            }
+            
             var stream = client.GetStream();
             
-            // 1. Get Clients Public RSA Key
+            // 1. Get Clients ECDH public key - length fixed
             byte[] lengthBytes = new byte[4];
-            await stream.ReadAsync(lengthBytes, 0, 4);
-            int publicKeyLength = BitConverter.ToInt32(lengthBytes, 0);
+            await ReadExactAsync(stream, lengthBytes, 0, 4);
+            int clientPublicKeyLength = BitConverter.ToInt32(lengthBytes, 0);
+            byte[] clientECDHPublicKey = new byte[clientPublicKeyLength];
+            await ReadExactAsync(stream, clientECDHPublicKey, 0, clientPublicKeyLength);
+            Console.WriteLine("Received client ECDH public key.");
             
-            byte[] publicKeyBytes = new byte[publicKeyLength];
-            await stream.ReadAsync(publicKeyBytes, 0, publicKeyLength);
-            string clientPublicKeyXml = Encoding.UTF8.GetString(publicKeyBytes);
-            RSAParameters clientPublicKey = RSAHelper.ImportPublicKey(clientPublicKeyXml);
-            Console.WriteLine("Received clients public RSA key.");
+            // 2. Generate server's ECDH key pair + get public key
+            using var serverECDH = ECDHHelper.CreateECDH(out byte[] serverECDHPublicKey);
             
-            // 2. Send AES session key, encrypted, to the client.
-            byte[] encryptedSessionKey = RSAHelper.EncryptRSA(_sessionKey, clientPublicKey);
-            byte[] encryptedKeyLength = BitConverter.GetBytes(encryptedSessionKey.Length);
-            await stream.WriteAsync(encryptedKeyLength, 0, 4);
-            await stream.WriteAsync(encryptedSessionKey, 0, encryptedSessionKey.Length);
-            Console.WriteLine("Sent encrypted session key to the client.");
+            // 3. Send Servers ECDH public key to client
+            byte[] serverPublicKeyLength = BitConverter.GetBytes(serverECDHPublicKey.Length);
+            await stream.WriteAsync(serverPublicKeyLength, 0, serverPublicKeyLength.Length);
+            await stream.WriteAsync(serverECDHPublicKey, 0, serverECDHPublicKey.Length);
+
+            Console.WriteLine("Sent server's ECDH public key to  client.");
             
-            // 3. Listen for encrypted messages from the client.
+            // 4. Derive shared key using ECDH
+            byte[] sharedKey = ECDHHelper.DeriveSharedKey(serverECDH, clientECDHPublicKey);
+            Console.WriteLine("Derived shared key using ECDH.");
+            
+            // 5. Encrypt group AES session key using the shared key.
+            // Converting AES key to Base64 string to encrypt it.
+            string sessionKeyBase64 = Convert.ToBase64String(_sessionKey);
+            var (ciphertext, iv, tag) = AESHelper.EncryptMessage(sessionKeyBase64, sharedKey);
+            string encryptedSessionKeyPayload = Convert.ToBase64String(ciphertext) + "|" +
+                                                Convert.ToBase64String(iv) + "|" +
+                                                Convert.ToBase64String(tag);
+            byte[] encryptedSessionKeyPayloadBytes = Encoding.UTF8.GetBytes(encryptedSessionKeyPayload);
+            byte[] payloadLengthBytes = BitConverter.GetBytes(encryptedSessionKeyPayloadBytes.Length);
+            await stream.WriteAsync( payloadLengthBytes, 0, 4);
+            await stream.WriteAsync( encryptedSessionKeyPayloadBytes, 0, encryptedSessionKeyPayloadBytes.Length);
+            Console.WriteLine("Sent encrypted group session key to client.");
+            
+            _clients.Add(client);
+
+            
+            // 6. Listen for encrypted messages from the client.
             byte[] buffer = new byte[1024];
             while (true)
             {
                 int byteCount = await stream.ReadAsync(buffer, 0, buffer.Length);
                 if (byteCount == 0)
-                    break;
-                // Client DC.
+                    break; // Client DC.
                 
                 string payload = Encoding.UTF8.GetString(buffer, 0, byteCount);
                 Console.WriteLine("Broker received encrypted message payload.");
@@ -118,7 +139,22 @@ public class BrokerServer
                 Console.WriteLine("Error publishing message: " + e.Message);
             }
         }
+        
     }
+        private async Task ReadExactAsync(NetworkStream stream, byte[] buffer, int offset, int count)
+        {
+            int totalRead = 0;
+            while (totalRead < count)
+            {
+                int bytesRead = await stream.ReadAsync(buffer, offset + totalRead, count - totalRead);
+                if (bytesRead == 0)
+                {
+                    throw new IOException("Unexpected end of stream.");
+                }
+                totalRead += bytesRead;
+            }
+        }
+
     
     // End
 }
